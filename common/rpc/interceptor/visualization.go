@@ -13,22 +13,60 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // VisualizationEvent represents a single RPC event for visualization
 type VisualizationEvent struct {
+	// Core fields (always present)
 	Timestamp    time.Time `json:"timestamp"`
 	EventID      string    `json:"event_id"`
 	Service      string    `json:"service"`
 	Direction    string    `json:"direction"`
 	Operation    string    `json:"operation"`
-	Namespace    string    `json:"namespace,omitempty"`
-	WorkflowID   string    `json:"workflow_id,omitempty"`
-	RunID        string    `json:"run_id,omitempty"`
-	TaskQueue    string    `json:"task_queue,omitempty"`
 	LatencyMs    int64     `json:"latency_ms"`
 	Status       string    `json:"status"`
 	ErrorMessage string    `json:"error_message,omitempty"`
+
+	// Workflow/Activity context (sometimes present)
+	Namespace   string `json:"namespace,omitempty"`
+	WorkflowID  string `json:"workflow_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	TaskQueue   string `json:"task_queue,omitempty"`
+	WorkflowType string `json:"workflow_type,omitempty"`
+	ActivityType string `json:"activity_type,omitempty"`
+
+	// Task details
+	TaskToken        string `json:"task_token,omitempty"`
+	TaskID           string `json:"task_id,omitempty"`
+	ScheduledEventID int64  `json:"scheduled_event_id,omitempty"`
+	StartedEventID   int64  `json:"started_event_id,omitempty"`
+	AttemptNumber    int32  `json:"attempt_number,omitempty"`
+	RetryState       string `json:"retry_state,omitempty"`
+
+	// Timeout configurations
+	ScheduleToCloseTimeoutMs int64 `json:"schedule_to_close_timeout_ms,omitempty"`
+	ScheduleToStartTimeoutMs int64 `json:"schedule_to_start_timeout_ms,omitempty"`
+	StartToCloseTimeoutMs    int64 `json:"start_to_close_timeout_ms,omitempty"`
+	HeartbeatTimeoutMs       int64 `json:"heartbeat_timeout_ms,omitempty"`
+
+	// Workflow execution details
+	WorkflowTaskTimeoutMs     int64  `json:"workflow_task_timeout_ms,omitempty"`
+	WorkflowExecutionTimeoutMs int64 `json:"workflow_execution_timeout_ms,omitempty"`
+	WorkflowRunTimeoutMs      int64  `json:"workflow_run_timeout_ms,omitempty"`
+	Memo                      string `json:"memo,omitempty"`
+	SearchAttributes          string `json:"search_attributes,omitempty"`
+
+	// Metadata
+	Identity         string `json:"identity,omitempty"`
+	ClientSDK        string `json:"client_sdk,omitempty"`
+	RequestSizeBytes int    `json:"request_size_bytes,omitempty"`
+	ResponseSizeBytes int   `json:"response_size_bytes,omitempty"`
+
+	// Payloads (can be large)
+	RequestPayload  string `json:"request_payload,omitempty"`
+	ResponsePayload string `json:"response_payload,omitempty"`
 }
 
 // VisualizationInterceptor captures RPC events and broadcasts to subscribers
@@ -37,7 +75,6 @@ type VisualizationInterceptor struct {
 	enabled     dynamicconfig.BoolPropertyFn
 	logger      log.Logger
 	subscribers sync.Map // map[string]chan *VisualizationEvent
-	mu          sync.RWMutex
 }
 
 // NewVisualizationInterceptor creates a new visualization interceptor
@@ -76,7 +113,6 @@ func (v *VisualizationInterceptor) Intercept(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-
 	// Check if enabled
 	if !v.enabled() {
 		return handler(ctx, req)
@@ -91,7 +127,11 @@ func (v *VisualizationInterceptor) Intercept(
 		Operation: extractOperationName(info.FullMethod),
 	}
 
-	// Extract workflow context if available (basic implementation)
+	// Capture request payload and size
+	event.RequestSizeBytes = estimateSize(req)
+	event.RequestPayload = capturePayload(req, 5000) // 5KB limit
+
+	// Extract workflow context and metadata
 	v.enrichEvent(event, req)
 
 	// Execute the actual RPC
@@ -104,6 +144,12 @@ func (v *VisualizationInterceptor) Intercept(
 		event.ErrorMessage = err.Error()
 	} else {
 		event.Status = "success"
+		
+		// Capture response payload and size
+		if resp != nil {
+			event.ResponseSizeBytes = estimateSize(resp)
+			event.ResponsePayload = capturePayload(resp, 5000) // 5KB limit
+		}
 	}
 
 	// Broadcast to all subscribers (non-blocking)
@@ -128,12 +174,9 @@ func (v *VisualizationInterceptor) broadcast(event *VisualizationEvent) {
 	})
 }
 
-// enrichEvent attempts to extract workflow/namespace context from the request
+// enrichEvent extracts detailed information from the request
 func (v *VisualizationInterceptor) enrichEvent(event *VisualizationEvent, req interface{}) {
-	// This is a simplified version - you could use reflection or type assertions
-	// to extract more detailed information from specific request types
-	
-	// For now, we'll just serialize to JSON to check for common fields
+	// Try to extract common fields using JSON serialization
 	data, err := json.Marshal(req)
 	if err != nil {
 		return
@@ -144,7 +187,7 @@ func (v *VisualizationInterceptor) enrichEvent(event *VisualizationEvent, req in
 		return
 	}
 
-	// Extract common fields if present
+	// Extract common fields
 	if ns, ok := reqMap["namespace"].(string); ok {
 		event.Namespace = ns
 	}
@@ -154,11 +197,18 @@ func (v *VisualizationInterceptor) enrichEvent(event *VisualizationEvent, req in
 	if runID, ok := reqMap["run_id"].(string); ok {
 		event.RunID = runID
 	}
-	if tq, ok := reqMap["task_queue"].(string); ok {
-		event.TaskQueue = tq
+	if identity, ok := reqMap["identity"].(string); ok {
+		event.Identity = identity
 	}
 
-	// Check nested execution field (common in workflow requests)
+	// Extract task queue
+	if tq, ok := reqMap["task_queue"].(map[string]interface{}); ok {
+		if name, ok := tq["name"].(string); ok {
+			event.TaskQueue = name
+		}
+	}
+
+	// Extract workflow execution info
 	if execution, ok := reqMap["workflow_execution"].(map[string]interface{}); ok {
 		if wfID, ok := execution["workflow_id"].(string); ok {
 			event.WorkflowID = wfID
@@ -167,6 +217,136 @@ func (v *VisualizationInterceptor) enrichEvent(event *VisualizationEvent, req in
 			event.RunID = runID
 		}
 	}
+
+	// Extract workflow type
+	if wfType, ok := reqMap["workflow_type"].(map[string]interface{}); ok {
+		if name, ok := wfType["name"].(string); ok {
+			event.WorkflowType = name
+		}
+	}
+
+	// Extract activity type
+	if actType, ok := reqMap["activity_type"].(map[string]interface{}); ok {
+		if name, ok := actType["name"].(string); ok {
+			event.ActivityType = name
+		}
+	}
+
+	// Extract task token (base64 encoded)
+	if token, ok := reqMap["task_token"].(string); ok {
+		event.TaskToken = token
+	}
+
+	// Extract attempt number
+	if attempt, ok := reqMap["attempt"].(float64); ok {
+		event.AttemptNumber = int32(attempt)
+	}
+
+	// Extract scheduled event ID
+	if schedID, ok := reqMap["scheduled_event_id"].(float64); ok {
+		event.ScheduledEventID = int64(schedID)
+	}
+
+	// Extract started event ID
+	if startID, ok := reqMap["started_event_id"].(float64); ok {
+		event.StartedEventID = int64(startID)
+	}
+
+	// Extract timeouts (convert seconds to milliseconds)
+	if timeout, ok := reqMap["schedule_to_close_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.ScheduleToCloseTimeoutMs = int64(seconds * 1000)
+		}
+	}
+	if timeout, ok := reqMap["schedule_to_start_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.ScheduleToStartTimeoutMs = int64(seconds * 1000)
+		}
+	}
+	if timeout, ok := reqMap["start_to_close_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.StartToCloseTimeoutMs = int64(seconds * 1000)
+		}
+	}
+	if timeout, ok := reqMap["heartbeat_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.HeartbeatTimeoutMs = int64(seconds * 1000)
+		}
+	}
+
+	// Extract workflow execution timeout
+	if timeout, ok := reqMap["workflow_execution_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.WorkflowExecutionTimeoutMs = int64(seconds * 1000)
+		}
+	}
+	if timeout, ok := reqMap["workflow_run_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.WorkflowRunTimeoutMs = int64(seconds * 1000)
+		}
+	}
+	if timeout, ok := reqMap["workflow_task_timeout"].(map[string]interface{}); ok {
+		if seconds, ok := timeout["seconds"].(float64); ok {
+			event.WorkflowTaskTimeoutMs = int64(seconds * 1000)
+		}
+	}
+
+	// Extract memo
+	if memo, ok := reqMap["memo"].(map[string]interface{}); ok {
+		if memoJSON, err := json.Marshal(memo); err == nil {
+			event.Memo = string(memoJSON)
+		}
+	}
+
+	// Extract search attributes
+	if attrs, ok := reqMap["search_attributes"].(map[string]interface{}); ok {
+		if attrsJSON, err := json.Marshal(attrs); err == nil {
+			event.SearchAttributes = string(attrsJSON)
+		}
+	}
+
+	// Extract retry state
+	if state, ok := reqMap["retry_state"].(string); ok {
+		event.RetryState = state
+	}
+}
+
+// capturePayload serializes a protobuf message to JSON with size limit
+func capturePayload(msg interface{}, maxBytes int) string {
+	// Try to convert to proto.Message
+	if protoMsg, ok := msg.(proto.Message); ok {
+		jsonBytes, err := protojson.Marshal(protoMsg)
+		if err != nil {
+			return fmt.Sprintf("[Error serializing: %v]", err)
+		}
+		
+		// Truncate if too large
+		if len(jsonBytes) > maxBytes {
+			return string(jsonBytes[:maxBytes]) + "... [TRUNCATED]"
+		}
+		return string(jsonBytes)
+	}
+
+	// Fallback to regular JSON
+	jsonBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Sprintf("[Error serializing: %v]", err)
+	}
+
+	// Truncate if too large
+	if len(jsonBytes) > maxBytes {
+		return string(jsonBytes[:maxBytes]) + "... [TRUNCATED]"
+	}
+	return string(jsonBytes)
+}
+
+// estimateSize estimates the size of a message in bytes
+func estimateSize(msg interface{}) int {
+	jsonBytes, err := json.Marshal(msg)
+	if err != nil {
+		return 0
+	}
+	return len(jsonBytes)
 }
 
 // extractOperationName extracts the method name from the full gRPC path
