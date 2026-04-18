@@ -92,8 +92,10 @@ var Module = fx.Options(
 	fx.Provide(ReactivationSignalCacheProvider),
 	workerdeployment.ClientModule,
 	fx.Provide(RoutingInfoCacheProvider),
+	fx.Provide(VisualizationInterceptorProvider),
+	fx.Provide(VisualizationWebSocketServerProvider),
 	fx.Invoke(ServiceLifetimeHooks),
-
+	fx.Invoke(VisualizationWebSocketLifetimeHooks),
 	callbacks.Module,
 	hsmnexusoperations.Module,
 	fx.Invoke(hsmnexusworkflow.RegisterCommandHandlers),
@@ -252,14 +254,38 @@ func MetadataContextInterceptorProvider() *interceptor.MetadataContextIntercepto
 	return interceptor.NewMetadataContextInterceptor()
 }
 
+// VisualizationInterceptorProvider creates the visualization interceptor for history service
+func VisualizationInterceptorProvider(
+	serviceName primitives.ServiceName,
+	logger log.Logger,
+	dc *dynamicconfig.Collection,
+) *interceptor.VisualizationInterceptor {
+	enabled := dynamicconfig.EnableVisualizationInterceptor.Get(dc)
+	return interceptor.NewVisualizationInterceptor(
+		string(serviceName),
+		enabled,
+		logger,
+	)
+}
+
+// VisualizationWebSocketServerProvider creates the WebSocket server for history service
+func VisualizationWebSocketServerProvider(
+	visualizationInterceptor *interceptor.VisualizationInterceptor,
+	logger log.Logger,
+) *VisualizationWebSocketServer {
+	return NewVisualizationWebSocketServer(visualizationInterceptor, logger, 7244)
+}
+
 func HistoryAdditionalInterceptorsProvider(
 	healthCheckInterceptor *interceptor.HealthCheckInterceptor,
 	metadataContextInterceptor *interceptor.MetadataContextInterceptor,
 	chasmRequestEngineInterceptor *chasm.ChasmEngineInterceptor,
 	chasmRequestVisibilityInterceptor *chasm.ChasmVisibilityInterceptor,
+	visualizationInterceptor *interceptor.VisualizationInterceptor,
 ) []grpc.UnaryServerInterceptor {
 	return []grpc.UnaryServerInterceptor{
 		metadataContextInterceptor.Intercept,
+		visualizationInterceptor.Intercept,  // ADD THIS LINE
 		healthCheckInterceptor.UnaryIntercept,
 		chasmRequestEngineInterceptor.Intercept,
 		chasmRequestVisibilityInterceptor.Intercept,
@@ -394,6 +420,21 @@ func EventNotifierProvider(
 
 func ServiceLifetimeHooks(lc fx.Lifecycle, svc *Service) {
 	lc.Append(fx.StartStopHook(svc.Start, svc.Stop))
+}
+
+// Add this new function after ServiceLifetimeHooks
+func VisualizationWebSocketLifetimeHooks(
+	lc fx.Lifecycle,
+	server *VisualizationWebSocketServer,
+) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			return server.Start()
+		},
+		OnStop: func(ctx context.Context) error {
+			return server.Stop(ctx)
+		},
+	})
 }
 
 func ReplicationProgressCacheProvider(

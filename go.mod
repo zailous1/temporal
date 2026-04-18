@@ -83,6 +83,8 @@ require (
 	modernc.org/sqlite v1.44.3
 )
 
+require github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.121.6 // indirect; indirect e

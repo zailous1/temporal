@@ -26,6 +26,7 @@ import (
 	"go.uber.org/fx"
 	"google.golang.org/grpc"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"context"
 )
 
 var Module = fx.Options(
@@ -47,7 +48,11 @@ var Module = fx.Options(
 	fx.Provide(ServiceResolverProvider),
 	fx.Provide(ServerProvider),
 	fx.Provide(NewService),
+	fx.Provide(VisualizationInterceptorProvider),
+	fx.Provide(MatchingAdditionalInterceptorsProvider),
+	fx.Provide(VisualizationWebSocketServerProvider),
 	fx.Invoke(ServiceLifetimeHooks),
+	fx.Invoke(VisualizationWebSocketLifetimeHooks),
 )
 
 func ServerProvider(grpcServerOptions []grpc.ServerOption) *grpc.Server {
@@ -92,6 +97,37 @@ func TelemetryInterceptorProvider(
 		serviceConfig.LogAllReqErrors,
 		requestErrorHandler,
 	)
+}
+
+// VisualizationInterceptorProvider creates the visualization interceptor for matching service
+func VisualizationInterceptorProvider(
+	serviceName primitives.ServiceName,
+	logger log.Logger,
+	dc *dynamicconfig.Collection,
+) *interceptor.VisualizationInterceptor {
+	enabled := dynamicconfig.EnableVisualizationInterceptor.Get(dc)
+	return interceptor.NewVisualizationInterceptor(
+		string(serviceName),
+		enabled,
+		logger,
+	)
+}
+
+// VisualizationWebSocketServerProvider creates the WebSocket server for history service
+func VisualizationWebSocketServerProvider(
+	visualizationInterceptor *interceptor.VisualizationInterceptor,
+	logger log.Logger,
+) *VisualizationWebSocketServer {
+	return NewVisualizationWebSocketServer(visualizationInterceptor, logger, 7245)
+}
+
+// MatchingAdditionalInterceptorsProvider returns additional interceptors for matching service
+func MatchingAdditionalInterceptorsProvider(
+	visualizationInterceptor *interceptor.VisualizationInterceptor,
+) []grpc.UnaryServerInterceptor {
+	return []grpc.UnaryServerInterceptor{
+		visualizationInterceptor.Intercept,
+	}
 }
 
 func ThrottledLoggerRpsFnProvider(serviceConfig *Config) resource.ThrottledLoggerRpsFn {
@@ -191,6 +227,21 @@ func VisibilityManagerProvider(
 
 func ServiceLifetimeHooks(lc fx.Lifecycle, svc *Service) {
 	lc.Append(fx.StartStopHook(svc.Start, svc.Stop))
+}
+
+// Add this new function after ServiceLifetimeHooks
+func VisualizationWebSocketLifetimeHooks(
+	lc fx.Lifecycle,
+	server *VisualizationWebSocketServer,
+) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			return server.Start()
+		},
+		OnStop: func(ctx context.Context) error {
+			return server.Stop(ctx)
+		},
+	})
 }
 
 func WorkersRegistryProvider(

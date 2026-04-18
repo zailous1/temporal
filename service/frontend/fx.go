@@ -123,6 +123,7 @@ var Module = fx.Options(
 	activity.FrontendModule,
 	fx.Provide(visibility.ChasmVisibilityManagerProvider),
 	fx.Provide(chasm.ChasmVisibilityInterceptorProvider),
+	fx.Provide(VisualizationInterceptorProvider),
 )
 
 func NewServiceProvider(
@@ -228,6 +229,7 @@ func GrpcServerOptionsProvider(
 	authInterceptor *authorization.Interceptor,
 	maskInternalErrorDetailsInterceptor *interceptor.MaskInternalErrorDetailsInterceptor,
 	slowRequestLoggerInterceptor *interceptor.SlowRequestLoggerInterceptor,
+	visualizationInterceptor *interceptor.VisualizationInterceptor,
 	chasmRequestVisibilityInterceptor *chasm.ChasmVisibilityInterceptor,
 	customInterceptors []grpc.UnaryServerInterceptor,
 	customStreamInterceptors []grpc.StreamServerInterceptor,
@@ -276,6 +278,7 @@ func GrpcServerOptionsProvider(
 		redirectionInterceptor.Intercept,
 		// Telemetry interceptor must be after redirection to ensure metrics are recorded in the correct cluster
 		telemetryInterceptor.UnaryIntercept,
+		visualizationInterceptor.Intercept,
 		healthInterceptor.Intercept,
 		namespaceValidatorInterceptor.StateValidationIntercept,
 		namespaceCountLimiterInterceptor.Intercept,
@@ -972,10 +975,17 @@ func HTTPAPIServerProvider(
 	namespaceRegistry namespace.Registry,
 	logger log.Logger,
 	router *mux.Router,
+	visualizationInterceptor *interceptor.VisualizationInterceptor, 
 ) (*HTTPAPIServer, error) {
 	if !httpEnabled(cfg, serviceName) {
 		return nil, nil
 	}
+
+	// Register visualization WebSocket endpoint BEFORE HTTPAPIServer takes over all routes
+	visualizationServer := NewVisualizationWebSocketServer(visualizationInterceptor, logger)
+	router.HandleFunc("/api/v1/visualization/stream", visualizationServer.HandleWebSocket)
+	logger.Info("Visualization WebSocket endpoint registered at /api/v1/visualization/stream")
+
 	rpcConfig := cfg.Services[string(serviceName)].RPC
 	return NewHTTPAPIServer(
 		serviceConfig,
@@ -1033,3 +1043,20 @@ func EndpointRegistryLifetimeHooks(lc fx.Lifecycle, registry nexus.EndpointRegis
 func ServiceLifetimeHooks(lc fx.Lifecycle, svc *Service) {
 	lc.Append(fx.StartStopHook(svc.Start, svc.Stop))
 }
+
+// VisualizationInterceptorProvider creates the visualization interceptor
+func VisualizationInterceptorProvider(
+	serviceName primitives.ServiceName,
+	logger log.Logger,
+	dc *dynamicconfig.Collection,
+) *interceptor.VisualizationInterceptor {
+	enabled := dynamicconfig.EnableVisualizationInterceptor.Get(dc)
+	return interceptor.NewVisualizationInterceptor(
+		string(serviceName),
+		enabled,
+		logger,
+	)
+}
+
+
+

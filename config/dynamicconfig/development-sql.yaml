@@ -73,3 +73,6 @@ history.enableChasm:
   - value: true
 activity.enableStandalone:
   - value: true
+system.enableVisualizationInterceptor:
+  - value: true
+
